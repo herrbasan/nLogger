@@ -1,12 +1,15 @@
 /**
  * Zero-dependency logging utility
- * 
+ *
  * Features:
- * - Timestamped log files (one per session)
+ * - Timestamped session log files (one per session)
+ * - Combined rolling main log (main-0.log, main-1.log, etc.)
+ * - JSON Lines format for main log (machine-parseable)
  * - Structured log format with event types
  * - Automatic log rotation (configurable retention)
  * - Multiple log levels (INFO, WARN, ERROR, DEBUG)
  * - JSON metadata support
+ * - Write buffering for better I/O performance
  */
 
 import fs from 'node:fs';
@@ -16,6 +19,9 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DEFAULT_LOG_RETENTION_DAYS = 1;
+const DEFAULT_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
+const DEFAULT_MAX_MAIN_LOG_FILES = 10;
+const DEFAULT_FLUSH_INTERVAL_MS = 1000;
 
 /**
  * Logger class - handles file-based logging with structured formatting
@@ -25,18 +31,41 @@ class Logger {
      * @param {object} options
      * @param {string} options.logsDir - Directory for log files (default: ../../logs relative to this file)
      * @param {string} options.sessionPrefix - Prefix for session ID (default: 'gw')
+     * @param {boolean} options.enableMainLog - Enable combined rolling log (default: true)
+     * @param {string} options.mainLogPrefix - Prefix for main log files (default: 'main')
+     * @param {number} options.maxFileSizeBytes - Max size per main log file (default: 10MB)
+     * @param {number} options.maxMainLogFiles - Max main log files to keep (default: 10)
+     * @param {number} options.flushIntervalMs - Force flush interval (default: 1000ms)
      */
     constructor(options = {}) {
         this.logsDir = options.logsDir || path.resolve(__dirname, '../../logs');
         this.sessionPrefix = options.sessionPrefix || 'gw';
-        
+
+        // Main log options
+        this.enableMainLog = options.enableMainLog !== false;
+        this.mainLogPrefix = options.mainLogPrefix || 'main';
+        this.maxFileSizeBytes = options.maxFileSizeBytes || DEFAULT_MAX_FILE_SIZE_BYTES;
+        this.maxMainLogFiles = options.maxMainLogFiles || DEFAULT_MAX_MAIN_LOG_FILES;
+        this.flushIntervalMs = options.flushIntervalMs || DEFAULT_FLUSH_INTERVAL_MS;
+
         this.logFile = null;
         this.logStream = null;
         this.startTime = new Date();
         this.sessionId = this._generateSessionId();
         this.logRetentionDays = this._resolveLogRetentionDays();
-        
+
+        // Main log state
+        this._mainLogBuffer = [];
+        this._mainLogCurrentSize = 0;
+        this._mainLogFileIndex = 0;
+        this._mainLogStream = null;
+        this._flushTimer = null;
+
         this._initializeLogFile();
+
+        if (this.enableMainLog) {
+            this._initializeMainLog();
+        }
     }
     
     _generateSessionId() {
@@ -103,7 +132,150 @@ class Logger {
             }
         }
     }
-    
+
+    // ==================== Main Log (Rolling) ====================
+
+    _initializeMainLog() {
+        this._mainLogFileIndex = this._findLatestMainLogIndex();
+        this._openMainLogStream();
+        this._flushTimer = setInterval(() => this._flushBuffer(), this.flushIntervalMs);
+    }
+
+    _findLatestMainLogIndex() {
+        let maxIndex = -1;
+        try {
+            const entries = fs.readdirSync(this.logsDir);
+            for (const name of entries) {
+                const match = name.match(/^main-(\d+)\.log$/);
+                if (match) {
+                    maxIndex = Math.max(maxIndex, parseInt(match[1], 10));
+                }
+            }
+        } catch (error) {
+            // Ignore errors, start from 0
+        }
+        return maxIndex + 1;
+    }
+
+    _openMainLogStream() {
+        const filename = `${this.mainLogPrefix}-${this._mainLogFileIndex}.log`;
+        const filePath = path.join(this.logsDir, filename);
+
+        this._mainLogStream = fs.createWriteStream(filePath, { flags: 'a' });
+
+        try {
+            const stats = fs.statSync(filePath);
+            this._mainLogCurrentSize = stats.size;
+        } catch {
+            this._mainLogCurrentSize = 0;
+        }
+    }
+
+    _writeToMainLog(level, type, message, meta) {
+        const entry = {
+            ts: new Date().toISOString(),
+            level,
+            type,
+            msg: message,
+            meta: Object.keys(meta).length > 0 ? meta : undefined,
+            session: this.sessionId
+        };
+
+        let line = JSON.stringify(entry) + '\n';
+        const lineBytes = Buffer.byteLength(line, 'utf8');
+
+        // Handle oversized entries
+        if (lineBytes > this.maxFileSizeBytes) {
+            entry.msg = entry.msg.substring(0, 1000) + '... [TRUNCATED]';
+            line = JSON.stringify(entry) + '\n';
+        }
+
+        this._mainLogBuffer.push(line);
+        this._mainLogCurrentSize += lineBytes;
+
+        // Auto-flush if buffer is large enough
+        if (this._mainLogBuffer.length >= 10) {
+            this._flushBuffer();
+        }
+
+        this._rollMainLogIfNeeded();
+    }
+
+    _flushBuffer() {
+        if (this._mainLogBuffer.length === 0 || !this._mainLogStream) {
+            return;
+        }
+
+        const batch = this._mainLogBuffer.join('');
+        const canContinue = this._mainLogStream.write(batch);
+        this._mainLogBuffer = [];
+
+        if (!canContinue) {
+            this._mainLogStream.once('drain', () => {});
+        }
+    }
+
+    _rollMainLogIfNeeded() {
+        if (this._mainLogCurrentSize >= this.maxFileSizeBytes) {
+            this._rollMainLog();
+        }
+    }
+
+    _rollMainLog() {
+        if (this._mainLogStream) {
+            this._mainLogStream.end();
+            this._mainLogStream = null;
+        }
+
+        this._mainLogFileIndex++;
+        this._pruneMainLogs();
+        this._openMainLogStream();
+    }
+
+    _pruneMainLogs() {
+        try {
+            const entries = fs.readdirSync(this.logsDir);
+            const mainLogs = [];
+
+            for (const name of entries) {
+                const match = name.match(/^main-(\d+)\.log$/);
+                if (match) {
+                    mainLogs.push({
+                        name,
+                        index: parseInt(match[1], 10),
+                        path: path.join(this.logsDir, name)
+                    });
+                }
+            }
+
+            // Sort by index descending
+            mainLogs.sort((a, b) => b.index - a.index);
+
+            // Delete files beyond maxMainLogFiles
+            for (let i = this.maxMainLogFiles; i < mainLogs.length; i++) {
+                fs.unlinkSync(mainLogs[i].path);
+            }
+        } catch (error) {
+            // Log retention failures should not stop the app
+        }
+    }
+
+    _closeMainLog() {
+        this._flushBuffer();
+
+        if (this._flushTimer) {
+            clearInterval(this._flushTimer);
+            this._flushTimer = null;
+        }
+
+        if (this._mainLogStream) {
+            this._mainLogStream.end();
+            this._mainLogStream = null;
+        }
+    }
+
+    // ==================== Session Log Write ====================
+
     _writeToFile(message) {
         if (this.logStream) {
             this.logStream.write(message + '\n');
@@ -134,6 +306,9 @@ class Logger {
     info(message, meta = {}, type = 'System') {
         const formatted = this._formatMessage('INFO', type, message, meta);
         this._writeToFile(formatted);
+        if (this.enableMainLog) {
+            this._writeToMainLog('INFO', type, message, meta);
+        }
     }
     
     /**
@@ -145,6 +320,9 @@ class Logger {
     warn(message, meta = {}, type = 'System') {
         const formatted = this._formatMessage('WARN', type, message, meta);
         this._writeToFile(formatted);
+        if (this.enableMainLog) {
+            this._writeToMainLog('WARN', type, message, meta);
+        }
     }
     
     /**
@@ -155,13 +333,16 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     error(message, error = null, meta = null, type = 'System') {
-        const errorMeta = error ? { 
-            error: error.message, 
+        const errorMeta = error ? {
+            error: error.message,
             stack: error.stack,
-            ...(meta || {}) 
+            ...(meta || {})
         } : (meta || {});
         const formatted = this._formatMessage('ERROR', type, message, errorMeta);
         this._writeToFile(formatted);
+        if (this.enableMainLog) {
+            this._writeToMainLog('ERROR', type, message, errorMeta);
+        }
     }
     
     /**
@@ -174,6 +355,9 @@ class Logger {
         if (process.env.DEBUG || process.env.NODE_ENV === 'development') {
             const formatted = this._formatMessage('DEBUG', type, message, meta);
             this._writeToFile(formatted);
+            if (this.enableMainLog) {
+                this._writeToMainLog('DEBUG', type, message, meta);
+            }
         }
     }
     
@@ -199,6 +383,10 @@ class Logger {
             this._writeToFile(`\n[${new Date().toISOString()}] [INFO] [System] ${shutdownMessage}. Session duration: ${Math.round(duration / 1000)}s`);
             this.logStream.end();
             this.logStream = null;
+        }
+
+        if (this.enableMainLog) {
+            this._closeMainLog();
         }
     }
 }

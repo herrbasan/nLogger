@@ -138,6 +138,8 @@ The new logger is **mostly the same** but with these improvements:
 
 3. **More resilient** - better error handling during initialization
 
+4. **Combined rolling log** - all sessions written to `main-0.log`, `main-1.log`, etc. in JSON Lines format for log viewers. Each entry tagged with its `sessionId` so you can filter by session. Enabled by default, see README for options.
+
 ## Migration from Current Logger
 
 Your current code will work with minimal changes:

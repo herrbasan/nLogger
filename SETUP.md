@@ -91,7 +91,7 @@ Each project can customize via environment variables:
 
 ```bash
 # .env file
-LOG_RETENTION_DAYS=7       # Keep logs for 7 days
+LOG_RETENTION_DAYS=7       # Keep session logs for 7 days
 DEBUG=true                 # Enable debug logging
 ```
 
@@ -102,9 +102,17 @@ import { createLogger } from './utils/logger.js';
 
 const logger = createLogger({
     logsDir: '/custom/log/path',
-    sessionPrefix: 'mcp'  // Changes session IDs from "gw-xxx" to "mcp-xxx"
+    sessionPrefix: 'mcp',  // Changes session IDs from "gw-xxx" to "mcp-xxx"
+
+    // Combined rolling log options (enabled by default)
+    enableMainLog: true,               // Set to false to disable
+    mainLogPrefix: 'main',            // Files: main-0.log, main-1.log, etc.
+    maxFileSizeBytes: 10 * 1024 * 1024, // 10MB per main log file
+    maxMainLogFiles: 10,              // Keep last 10 main logs
 });
 ```
+
+**Combined Rolling Log**: All log entries are written to rolling main log files (`main-0.log`, `main-1.log`, etc.) in JSON Lines format. Each entry includes a `session` field so you can filter by session. Session logs remain unchanged (one file per session, auto-deleted by retention). See README for details.
 
 ## Cloning a Project with Submodules
 
