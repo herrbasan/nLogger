@@ -45,7 +45,8 @@ class Logger {
      * @param {number} options.flushIntervalMs - Force flush interval (default: 1000ms)
      */
     constructor(options = {}) {
-        this.logsDir = options.logsDir || path.resolve(__dirname, '../../logs');
+        // Resolve from project root (submodule is at src/nLogger/src/logger.js)
+        this.logsDir = options.logsDir || path.resolve(__dirname, '../../../logs');
         this.sessionPrefix = options.sessionPrefix || 'gw';
 
         // Main log options
