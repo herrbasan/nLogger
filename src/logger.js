@@ -196,19 +196,24 @@ class Logger {
     }
 
     _findLatestMainLogIndex() {
-        let maxIndex = -1;
+        let maxIndex = 0;
         try {
             const entries = fs.readdirSync(this.logsDir);
+            const regex = new RegExp(`^${this.mainLogPrefix}-(\\d+)\\.log$`);
+            let foundAny = false;
             for (const name of entries) {
-                const match = name.match(/^main-(\d+)\.log$/);
+                const match = name.match(regex);
                 if (match) {
                     maxIndex = Math.max(maxIndex, parseInt(match[1], 10));
+                    foundAny = true;
                 }
             }
+            if (!foundAny) return 0;
         } catch (error) {
             // Ignore errors, start from 0
+            return 0;
         }
-        return maxIndex + 1;
+        return maxIndex;
     }
 
     _openMainLogStream() {
