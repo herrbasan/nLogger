@@ -10,6 +10,7 @@
  * - Multiple log levels (INFO, WARN, ERROR, DEBUG)
  * - JSON metadata support
  * - Write buffering for better I/O performance
+ * - Automatic binary/base64 data sanitization (prevents log bloat from image/audio data)
  */
 
 import fs from 'node:fs';
@@ -22,6 +23,12 @@ const DEFAULT_LOG_RETENTION_DAYS = 1;
 const DEFAULT_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
 const DEFAULT_MAX_MAIN_LOG_FILES = 10;
 const DEFAULT_FLUSH_INTERVAL_MS = 1000;
+
+// Binary field names that commonly contain large base64 data
+const BINARY_FIELDS = ['b64_json', 'base64', 'bytesBase64Encoded', 'inlineData', 'data', 'buffer', 'blob'];
+const BINARY_PLACEHOLDER = '[BINARY_DATA]';
+const LONG_STRING_THRESHOLD = 500;
+const TRUNCATE_TO_LENGTH = 200;
 
 /**
  * Logger class - handles file-based logging with structured formatting
@@ -71,7 +78,53 @@ class Logger {
     _generateSessionId() {
         return `${this.sessionPrefix}-${Date.now().toString(36).slice(-6)}`;
     }
-    
+
+    _isLongBase64(value) {
+        if (typeof value !== 'string' || value.length < 100) return false;
+        // Base64 pattern: alphanumeric with +/= at end
+        const base64Pattern = /^[A-Za-z0-9+/=]+$/;
+        return base64Pattern.test(value) && value.length > LONG_STRING_THRESHOLD;
+    }
+
+    _sanitizeValue(value) {
+        if (value === null || value === undefined) return value;
+
+        if (typeof value === 'string') {
+            if (this._isLongBase64(value)) {
+                return `${BINARY_PLACEHOLDER}(${value.length} chars)`;
+            }
+            if (value.length > LONG_STRING_THRESHOLD) {
+                return value.substring(0, TRUNCATE_TO_LENGTH) + `... [${value.length} chars total]`;
+            }
+            return value;
+        }
+
+        if (typeof value === 'number' || typeof value === 'boolean') return value;
+
+        if (Array.isArray(value)) {
+            return value.map(item => this._sanitizeValue(item));
+        }
+
+        if (typeof value === 'object') {
+            const sanitized = {};
+            for (const [key, val] of Object.entries(value)) {
+                if (BINARY_FIELDS.includes(key) && typeof val === 'string' && val.length > 100) {
+                    sanitized[key] = `${BINARY_PLACEHOLDER}(${val.length} chars)`;
+                } else {
+                    sanitized[key] = this._sanitizeValue(val);
+                }
+            }
+            return sanitized;
+        }
+
+        return value;
+    }
+
+    _sanitizeMeta(meta) {
+        if (!meta || typeof meta !== 'object') return {};
+        return this._sanitizeValue(meta);
+    }
+
     _initializeLogFile() {
         // Ensure logs directory exists
         if (!fs.existsSync(this.logsDir)) {
@@ -304,10 +357,11 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     info(message, meta = {}, type = 'System') {
-        const formatted = this._formatMessage('INFO', type, message, meta);
+        const safeMeta = this._sanitizeMeta(meta);
+        const formatted = this._formatMessage('INFO', type, message, safeMeta);
         this._writeToFile(formatted);
         if (this.enableMainLog) {
-            this._writeToMainLog('INFO', type, message, meta);
+            this._writeToMainLog('INFO', type, message, safeMeta);
         }
     }
     
@@ -318,10 +372,11 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     warn(message, meta = {}, type = 'System') {
-        const formatted = this._formatMessage('WARN', type, message, meta);
+        const safeMeta = this._sanitizeMeta(meta);
+        const formatted = this._formatMessage('WARN', type, message, safeMeta);
         this._writeToFile(formatted);
         if (this.enableMainLog) {
-            this._writeToMainLog('WARN', type, message, meta);
+            this._writeToMainLog('WARN', type, message, safeMeta);
         }
     }
     
@@ -338,10 +393,11 @@ class Logger {
             stack: error.stack,
             ...(meta || {})
         } : (meta || {});
-        const formatted = this._formatMessage('ERROR', type, message, errorMeta);
+        const safeMeta = this._sanitizeMeta(errorMeta);
+        const formatted = this._formatMessage('ERROR', type, message, safeMeta);
         this._writeToFile(formatted);
         if (this.enableMainLog) {
-            this._writeToMainLog('ERROR', type, message, errorMeta);
+            this._writeToMainLog('ERROR', type, message, safeMeta);
         }
     }
     
@@ -353,10 +409,11 @@ class Logger {
      */
     debug(message, meta = {}, type = 'System') {
         if (process.env.DEBUG || process.env.NODE_ENV === 'development') {
-            const formatted = this._formatMessage('DEBUG', type, message, meta);
+            const safeMeta = this._sanitizeMeta(meta);
+            const formatted = this._formatMessage('DEBUG', type, message, safeMeta);
             this._writeToFile(formatted);
             if (this.enableMainLog) {
-                this._writeToMainLog('DEBUG', type, message, meta);
+                this._writeToMainLog('DEBUG', type, message, safeMeta);
             }
         }
     }
