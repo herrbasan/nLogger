@@ -209,11 +209,17 @@ class Logger {
                 }
             }
             if (!foundAny) return 0;
+
+            // Check if the latest file has room to append
+            const latestFilePath = path.join(this.logsDir, `${this.mainLogPrefix}-${maxIndex}.log`);
+            const stats = fs.statSync(latestFilePath);
+            if (stats.size < this.maxFileSizeBytes) {
+                return maxIndex;  // Append to existing file
+            }
+            return maxIndex + 1;  // Start new file since latest is full
         } catch (error) {
-            // Ignore errors, start from 0
             return 0;
         }
-        return maxIndex + 1;
     }
 
     _openMainLogStream() {
