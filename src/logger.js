@@ -213,7 +213,7 @@ class Logger {
             // Ignore errors, start from 0
             return 0;
         }
-        return maxIndex;
+        return maxIndex + 1;
     }
 
     _openMainLogStream() {
