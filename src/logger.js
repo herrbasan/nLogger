@@ -68,6 +68,7 @@ class Logger {
         this._mainLogFileIndex = 0;
         this._mainLogStream = null;
         this._flushTimer = null;
+        this._drainListenerAdded = false;
 
         this._initializeLogFile();
 
@@ -275,8 +276,11 @@ class Logger {
         const canContinue = this._mainLogStream.write(batch);
         this._mainLogBuffer = [];
 
-        if (!canContinue) {
-            this._mainLogStream.once('drain', () => {});
+        if (!canContinue && !this._drainListenerAdded) {
+            this._drainListenerAdded = true;
+            this._mainLogStream.once('drain', () => {
+                this._drainListenerAdded = false;
+            });
         }
     }
 
@@ -293,6 +297,7 @@ class Logger {
         }
 
         this._mainLogFileIndex++;
+        this._drainListenerAdded = false;
         this._pruneMainLogs();
         this._openMainLogStream();
     }
