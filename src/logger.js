@@ -127,6 +127,17 @@ class Logger {
         return this._sanitizeValue(meta);
     }
 
+    _sanitizeMessage(message) {
+        if (typeof message !== 'string') return message;
+        return message
+            .replace(/\r\n/g, '\\n')
+            .replace(/\n/g, '\\n')
+            .replace(/\r/g, '\\n')
+            .replace(/\t/g, '    ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
     _initializeLogFile() {
         // Ensure logs directory exists
         if (!fs.existsSync(this.logsDir)) {
@@ -361,10 +372,11 @@ class Logger {
      */
     _formatMessage(level, type, message, meta = {}) {
         const timestamp = new Date().toISOString();
+        const sanitizedMessage = this._sanitizeMessage(message);
         const metaStr = Object.keys(meta).length > 0 
             ? ' ' + JSON.stringify(meta) 
             : '';
-        return `[${timestamp}] [${level}] [${type}] ${message}${metaStr}`;
+        return `[${timestamp}] [${level}] [${type}] ${sanitizedMessage}${metaStr}`;
     }
     
     /**
@@ -407,7 +419,7 @@ class Logger {
     error(message, error = null, meta = null, type = 'System') {
         const errorMeta = error ? {
             error: error.message,
-            stack: error.stack,
+            stack: error.stack ? this._sanitizeMessage(error.stack) : undefined,
             ...(meta || {})
         } : (meta || {});
         const safeMeta = this._sanitizeMeta(errorMeta);
