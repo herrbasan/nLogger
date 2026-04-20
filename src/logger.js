@@ -385,12 +385,15 @@ class Logger {
      * @param {object} meta - Metadata object
      * @param {string} type - Event type/category (default: 'System')
      */
-    info(message, meta = {}, type = 'System') {
+    info(message, meta = {}, type = 'System', options = {}) {
         const safeMeta = this._sanitizeMeta(meta);
         const formatted = this._formatMessage('INFO', type, message, safeMeta);
         this._writeToFile(formatted);
         if (this.enableMainLog) {
             this._writeToMainLog('INFO', type, message, safeMeta);
+        }
+        if (options.console) {
+            console.log(formatted);
         }
     }
     
@@ -400,12 +403,15 @@ class Logger {
      * @param {object} meta - Metadata object
      * @param {string} type - Event type/category (default: 'System')
      */
-    warn(message, meta = {}, type = 'System') {
+    warn(message, meta = {}, type = 'System', options = {}) {
         const safeMeta = this._sanitizeMeta(meta);
         const formatted = this._formatMessage('WARN', type, message, safeMeta);
         this._writeToFile(formatted);
         if (this.enableMainLog) {
             this._writeToMainLog('WARN', type, message, safeMeta);
+        }
+        if (options.console) {
+            console.log(formatted);
         }
     }
     
@@ -416,7 +422,7 @@ class Logger {
      * @param {object|null} meta - Additional metadata
      * @param {string} type - Event type/category (default: 'System')
      */
-    error(message, error = null, meta = null, type = 'System') {
+    error(message, error = null, meta = null, type = 'System', options = {}) {
         const errorMeta = error ? {
             error: error.message,
             stack: error.stack ? this._sanitizeMessage(error.stack) : undefined,
@@ -428,6 +434,9 @@ class Logger {
         if (this.enableMainLog) {
             this._writeToMainLog('ERROR', type, message, safeMeta);
         }
+        if (options.console) {
+            console.error(formatted);
+        }
     }
     
     /**
@@ -436,13 +445,16 @@ class Logger {
      * @param {object} meta - Metadata object
      * @param {string} type - Event type/category (default: 'System')
      */
-    debug(message, meta = {}, type = 'System') {
+    debug(message, meta = {}, type = 'System', options = {}) {
         if (process.env.DEBUG || process.env.NODE_ENV === 'development') {
             const safeMeta = this._sanitizeMeta(meta);
             const formatted = this._formatMessage('DEBUG', type, message, safeMeta);
             this._writeToFile(formatted);
             if (this.enableMainLog) {
                 this._writeToMainLog('DEBUG', type, message, safeMeta);
+            }
+            if (options.console) {
+                console.log(formatted);
             }
         }
     }
