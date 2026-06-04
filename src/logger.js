@@ -3,10 +3,10 @@
  *
  * Features:
  * - Timestamped session log files (one per session)
- * - Combined rolling main log (main-0.log, main-1.log, etc.)
+ * - Combined rolling main log (main.log = current, main-1.log, main-2.log, etc.)
  * - JSON Lines format for main log (machine-parseable)
  * - Structured log format with event types
- * - Automatic log rotation (configurable retention)
+ * - Automatic log rotation by size (ring-buffer: main.log → main-1.log → main-2.log)
  * - Multiple log levels (INFO, WARN, ERROR, DEBUG)
  * - JSON metadata support
  * - Write buffering for better I/O performance
@@ -41,7 +41,7 @@ class Logger {
      * @param {boolean} options.enableMainLog - Enable combined rolling log (default: true)
      * @param {string} options.mainLogPrefix - Prefix for main log files (default: 'main')
      * @param {number} options.maxFileSizeBytes - Max size per main log file (default: 10MB)
-     * @param {number} options.maxMainLogFiles - Max main log files to keep (default: 10)
+     * @param {number} options.maxMainLogFiles - Max main log files to keep (including main.log; default: 10)
      * @param {number} options.flushIntervalMs - Force flush interval (default: 1000ms)
      */
     constructor(options = {}) {
@@ -65,7 +65,6 @@ class Logger {
         // Main log state
         this._mainLogBuffer = [];
         this._mainLogCurrentSize = 0;
-        this._mainLogFileIndex = 0;
         this._mainLogStream = null;
         this._flushTimer = null;
         this._drainListenerAdded = false;
@@ -183,6 +182,8 @@ class Logger {
             const entries = fs.readdirSync(this.logsDir, { withFileTypes: true });
             for (const entry of entries) {
                 if (!entry.isFile() || !entry.name.endsWith('.log')) continue;
+                // Main log files are managed by _pruneMainLogs with a count-based policy
+                if (entry.name.startsWith(`${this.mainLogPrefix}-`) || entry.name === `${this.mainLogPrefix}.log`) continue;
 
                 const filePath = path.join(this.logsDir, entry.name);
                 const stats = fs.statSync(filePath);
@@ -200,44 +201,92 @@ class Logger {
     }
 
     // ==================== Main Log (Rolling) ====================
+    //
+    // Naming convention (ring buffer, conventional rotation):
+    //   main.log    = current active file (always the newest)
+    //   main-1.log  = most recently rolled
+    //   main-2.log  = second most recently rolled
+    //   ...
+    //   main-N.log  = oldest (higher number = older)
 
     _initializeMainLog() {
-        this._mainLogFileIndex = this._findLatestMainLogIndex();
+        const mainPath = this._mainLogPath();
+        try {
+            const stats = fs.statSync(mainPath);
+            if (stats.size >= this.maxFileSizeBytes) {
+                this._rotateMainLogs();
+            }
+        } catch {
+            // No main.log — check for orphaned old-format files and clean up
+            this._migrateOldMainLogs();
+        }
         this._openMainLogStream();
+        this._pruneMainLogs();
         this._flushTimer = setInterval(() => this._flushBuffer(), this.flushIntervalMs);
     }
 
-    _findLatestMainLogIndex() {
-        let maxIndex = 0;
+    // Migrate old monotonically-incrementing main-N.log files into the ring buffer.
+    // Old scheme: main-0.log (oldest) ... main-N.log (newest), higher index = newer.
+    // New scheme: main.log (current), main-1.log (most recent rotated), higher index = older.
+    // We remap sorted old files into the ring buffer, preserving history.
+    _migrateOldMainLogs() {
         try {
             const entries = fs.readdirSync(this.logsDir);
             const regex = new RegExp(`^${this.mainLogPrefix}-(\\d+)\\.log$`);
-            let foundAny = false;
+            const oldFiles = [];
             for (const name of entries) {
                 const match = name.match(regex);
                 if (match) {
-                    maxIndex = Math.max(maxIndex, parseInt(match[1], 10));
-                    foundAny = true;
+                    oldFiles.push({
+                        name,
+                        index: parseInt(match[1], 10),
+                        path: path.join(this.logsDir, name)
+                    });
                 }
             }
-            if (!foundAny) return 0;
+            if (oldFiles.length === 0) return;
 
-            // Check if the latest file has room to append
-            const latestFilePath = path.join(this.logsDir, `${this.mainLogPrefix}-${maxIndex}.log`);
-            const stats = fs.statSync(latestFilePath);
-            if (stats.size < this.maxFileSizeBytes) {
-                return maxIndex;  // Append to existing file
+            // Sort by index descending: highest = newest, becomes main.log
+            oldFiles.sort((a, b) => b.index - a.index);
+
+            let remapped = 0;
+            const maxRotated = this.maxMainLogFiles - 1;
+
+            for (let i = 0; i < oldFiles.length; i++) {
+                let targetName;
+                if (i === 0) {
+                    targetName = `${this.mainLogPrefix}.log`;
+                } else if (i <= maxRotated) {
+                    targetName = `${this.mainLogPrefix}-${i}.log`;
+                } else {
+                    // Beyond capacity — delete
+                    fs.unlinkSync(oldFiles[i].path);
+                    remapped++;
+                    continue;
+                }
+                const targetPath = path.join(this.logsDir, targetName);
+                // If target already exists (e.g. old & new formats mixed), remove it first
+                if (fs.existsSync(targetPath)) {
+                    fs.unlinkSync(targetPath);
+                }
+                fs.renameSync(oldFiles[i].path, targetPath);
+                remapped++;
             }
-            return maxIndex + 1;  // Start new file since latest is full
-        } catch (error) {
-            return 0;
+
+            this._writeToFile(
+                `[${new Date().toISOString()}] [INFO] [System] Migrated ${remapped} log file(s) from old naming scheme into ring buffer`
+            );
+        } catch {
+            // Best-effort — never block startup for cleanup
         }
     }
 
-    _openMainLogStream() {
-        const filename = `${this.mainLogPrefix}-${this._mainLogFileIndex}.log`;
-        const filePath = path.join(this.logsDir, filename);
+    _mainLogPath() {
+        return path.join(this.logsDir, `${this.mainLogPrefix}.log`);
+    }
 
+    _openMainLogStream() {
+        const filePath = this._mainLogPath();
         this._mainLogStream = fs.createWriteStream(filePath, { flags: 'a' });
 
         try {
@@ -303,23 +352,62 @@ class Logger {
 
     _rollMainLog() {
         if (this._mainLogStream) {
+            this._flushBuffer();
             this._mainLogStream.end();
             this._mainLogStream = null;
         }
-
-        this._mainLogFileIndex++;
         this._drainListenerAdded = false;
-        this._pruneMainLogs();
+
+        this._rotateMainLogs();
         this._openMainLogStream();
+        this._pruneMainLogs();
+    }
+
+    _rotateMainLogs() {
+        // Shift all existing rotated files: main-N.log → main-(N+1).log
+        // Process from highest index down to avoid overwrites.
+        // Then rename main.log → main-1.log.
+        try {
+            const entries = fs.readdirSync(this.logsDir);
+            const regex = new RegExp(`^${this.mainLogPrefix}-(\\d+)\\.log$`);
+            const indices = [];
+            for (const name of entries) {
+                const match = name.match(regex);
+                if (match) indices.push(parseInt(match[1], 10));
+            }
+            indices.sort((a, b) => b - a); // descending
+
+            // Delete anything that would exceed capacity after the shift
+            const maxRotated = this.maxMainLogFiles - 1; // main.log doesn't count toward rotated count
+            for (const idx of indices) {
+                const oldPath = path.join(this.logsDir, `${this.mainLogPrefix}-${idx}.log`);
+                if (idx >= maxRotated) {
+                    fs.unlinkSync(oldPath);
+                } else {
+                    const newPath = path.join(this.logsDir, `${this.mainLogPrefix}-${idx + 1}.log`);
+                    fs.renameSync(oldPath, newPath);
+                }
+            }
+
+            // Move main.log → main-1.log
+            const currentPath = this._mainLogPath();
+            if (fs.existsSync(currentPath)) {
+                const rotatedPath = path.join(this.logsDir, `${this.mainLogPrefix}-1.log`);
+                fs.renameSync(currentPath, rotatedPath);
+            }
+        } catch {
+            // Best-effort rotation — next write will create a fresh main.log
+        }
     }
 
     _pruneMainLogs() {
         try {
             const entries = fs.readdirSync(this.logsDir);
             const mainLogs = [];
+            const regex = new RegExp(`^${this.mainLogPrefix}-(\\d+)\\.log$`);
 
             for (const name of entries) {
-                const match = name.match(/^main-(\d+)\.log$/);
+                const match = name.match(regex);
                 if (match) {
                     mainLogs.push({
                         name,
@@ -329,14 +417,15 @@ class Logger {
                 }
             }
 
-            // Sort by index descending
+            // Sort by index descending (highest = oldest, delete those first)
             mainLogs.sort((a, b) => b.index - a.index);
 
-            // Delete files beyond maxMainLogFiles
-            for (let i = this.maxMainLogFiles; i < mainLogs.length; i++) {
+            // Keep at most maxMainLogFiles - 1 rotated files (main.log is the Nth file)
+            const keepMax = this.maxMainLogFiles - 1;
+            for (let i = keepMax; i < mainLogs.length; i++) {
                 fs.unlinkSync(mainLogs[i].path);
             }
-        } catch (error) {
+        } catch {
             // Log retention failures should not stop the app
         }
     }
