@@ -3,10 +3,10 @@
  *
  * Features:
  * - Timestamped session log files (one per session)
- * - Combined rolling main log (main.log = current, main-1.log, main-2.log, etc.)
+ * - Combined rolling main log (main-0.log = current, main-1.log, main-2.log, etc.)
  * - JSON Lines format for main log (machine-parseable)
  * - Structured log format with event types
- * - Automatic log rotation by size (ring-buffer: main.log → main-1.log → main-2.log)
+ * - Automatic log rotation by size (ring-buffer: main-0.log → main-1.log → main-2.log)
  * - Multiple log levels (INFO, WARN, ERROR, DEBUG)
  * - JSON metadata support
  * - Write buffering for better I/O performance
@@ -41,7 +41,7 @@ class Logger {
      * @param {boolean} options.enableMainLog - Enable combined rolling log (default: true)
      * @param {string} options.mainLogPrefix - Prefix for main log files (default: 'main')
      * @param {number} options.maxFileSizeBytes - Max size per main log file (default: 10MB)
-     * @param {number} options.maxMainLogFiles - Max main log files to keep (including main.log; default: 10)
+     * @param {number} options.maxMainLogFiles - Max main log files to keep (including main-0.log; default: 10)
      * @param {number} options.flushIntervalMs - Force flush interval (default: 1000ms)
      */
     constructor(options = {}) {
@@ -183,7 +183,8 @@ class Logger {
             for (const entry of entries) {
                 if (!entry.isFile() || !entry.name.endsWith('.log')) continue;
                 // Main log files are managed by _pruneMainLogs with a count-based policy
-                if (entry.name.startsWith(`${this.mainLogPrefix}-`) || entry.name === `${this.mainLogPrefix}.log`) continue;
+                // Main log files are managed by _pruneMainLogs with a count-based policy
+                if (entry.name.startsWith(`${this.mainLogPrefix}-`)) continue;
 
                 const filePath = path.join(this.logsDir, entry.name);
                 const stats = fs.statSync(filePath);
@@ -203,7 +204,7 @@ class Logger {
     // ==================== Main Log (Rolling) ====================
     //
     // Naming convention (ring buffer, conventional rotation):
-    //   main.log    = current active file (always the newest)
+    //   main-0.log  = current active file (always the newest)
     //   main-1.log  = most recently rolled
     //   main-2.log  = second most recently rolled
     //   ...
@@ -217,7 +218,7 @@ class Logger {
                 this._rotateMainLogs();
             }
         } catch {
-            // No main.log — check for orphaned old-format files and clean up
+        // No main-0.log — check for orphaned old-format files and clean up
             this._migrateOldMainLogs();
         }
         this._openMainLogStream();
@@ -227,8 +228,8 @@ class Logger {
 
     // Migrate old monotonically-incrementing main-N.log files into the ring buffer.
     // Old scheme: main-0.log (oldest) ... main-N.log (newest), higher index = newer.
-    // New scheme: main.log (current), main-1.log (most recent rotated), higher index = older.
-    // We remap sorted old files into the ring buffer, preserving history.
+    // New scheme: main-0.log (current), main-1.log (most recent rotated), higher index = older.
+    // Sort by mtime (most recent first) and remap into the ring buffer, preserving history.
     _migrateOldMainLogs() {
         try {
             const entries = fs.readdirSync(this.logsDir);
@@ -237,17 +238,23 @@ class Logger {
             for (const name of entries) {
                 const match = name.match(regex);
                 if (match) {
-                    oldFiles.push({
-                        name,
-                        index: parseInt(match[1], 10),
-                        path: path.join(this.logsDir, name)
-                    });
+                    const fullPath = path.join(this.logsDir, name);
+                    try {
+                        const stat = fs.statSync(fullPath);
+                        oldFiles.push({
+                            name,
+                            path: fullPath,
+                            mtime: stat.mtimeMs
+                        });
+                    } catch {
+                        // Skip unreadable files
+                    }
                 }
             }
             if (oldFiles.length === 0) return;
 
-            // Sort by index descending: highest = newest, becomes main.log
-            oldFiles.sort((a, b) => b.index - a.index);
+            // Sort by mtime descending: most recent first → becomes main-0.log
+            oldFiles.sort((a, b) => b.mtime - a.mtime);
 
             let remapped = 0;
             const maxRotated = this.maxMainLogFiles - 1;
@@ -255,7 +262,7 @@ class Logger {
             for (let i = 0; i < oldFiles.length; i++) {
                 let targetName;
                 if (i === 0) {
-                    targetName = `${this.mainLogPrefix}.log`;
+                    targetName = `${this.mainLogPrefix}-0.log`;
                 } else if (i <= maxRotated) {
                     targetName = `${this.mainLogPrefix}-${i}.log`;
                 } else {
@@ -266,10 +273,12 @@ class Logger {
                 }
                 const targetPath = path.join(this.logsDir, targetName);
                 // If target already exists (e.g. old & new formats mixed), remove it first
-                if (fs.existsSync(targetPath)) {
+                if (fs.existsSync(targetPath) && targetPath !== oldFiles[i].path) {
                     fs.unlinkSync(targetPath);
                 }
-                fs.renameSync(oldFiles[i].path, targetPath);
+                if (oldFiles[i].path !== targetPath) {
+                    fs.renameSync(oldFiles[i].path, targetPath);
+                }
                 remapped++;
             }
 
@@ -282,7 +291,7 @@ class Logger {
     }
 
     _mainLogPath() {
-        return path.join(this.logsDir, `${this.mainLogPrefix}.log`);
+        return path.join(this.logsDir, `${this.mainLogPrefix}-0.log`);
     }
 
     _openMainLogStream() {
@@ -366,7 +375,7 @@ class Logger {
     _rotateMainLogs() {
         // Shift all existing rotated files: main-N.log → main-(N+1).log
         // Process from highest index down to avoid overwrites.
-        // Then rename main.log → main-1.log.
+        // Then rename main-0.log → main-1.log.
         try {
             const entries = fs.readdirSync(this.logsDir);
             const regex = new RegExp(`^${this.mainLogPrefix}-(\\d+)\\.log$`);
@@ -377,9 +386,10 @@ class Logger {
             }
             indices.sort((a, b) => b - a); // descending
 
-            // Delete anything that would exceed capacity after the shift
-            const maxRotated = this.maxMainLogFiles - 1; // main.log doesn't count toward rotated count
+            const maxRotated = this.maxMainLogFiles - 1; // main-0.log doesn't count toward rotated count
+
             for (const idx of indices) {
+                if (idx === 0) continue; // main-0.log handled separately below
                 const oldPath = path.join(this.logsDir, `${this.mainLogPrefix}-${idx}.log`);
                 if (idx >= maxRotated) {
                     fs.unlinkSync(oldPath);
@@ -389,14 +399,14 @@ class Logger {
                 }
             }
 
-            // Move main.log → main-1.log
+            // Move main-0.log → main-1.log
             const currentPath = this._mainLogPath();
             if (fs.existsSync(currentPath)) {
                 const rotatedPath = path.join(this.logsDir, `${this.mainLogPrefix}-1.log`);
                 fs.renameSync(currentPath, rotatedPath);
             }
         } catch {
-            // Best-effort rotation — next write will create a fresh main.log
+            // Best-effort rotation — next write will create a fresh main-0.log
         }
     }
 
@@ -409,9 +419,11 @@ class Logger {
             for (const name of entries) {
                 const match = name.match(regex);
                 if (match) {
+                    const idx = parseInt(match[1], 10);
+                    if (idx === 0) continue; // main-0.log is current, never pruned here
                     mainLogs.push({
                         name,
-                        index: parseInt(match[1], 10),
+                        index: idx,
                         path: path.join(this.logsDir, name)
                     });
                 }
@@ -420,7 +432,7 @@ class Logger {
             // Sort by index descending (highest = oldest, delete those first)
             mainLogs.sort((a, b) => b.index - a.index);
 
-            // Keep at most maxMainLogFiles - 1 rotated files (main.log is the Nth file)
+            // Keep at most maxMainLogFiles - 1 rotated files (main-0.log is the Nth file)
             const keepMax = this.maxMainLogFiles - 1;
             for (let i = keepMax; i < mainLogs.length; i++) {
                 fs.unlinkSync(mainLogs[i].path);
