@@ -24,6 +24,15 @@ const DEFAULT_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
 const DEFAULT_MAX_MAIN_LOG_FILES = 10;
 const DEFAULT_FLUSH_INTERVAL_MS = 1000;
 
+// Log levels. The gateway runs quiet by default (errors only) and is switched
+// to verbose when actively working on it. minLevel is runtime-settable.
+const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+
+function resolveInitialLevel() {
+    const raw = (process.env.LOG_LEVEL || '').toLowerCase();
+    return raw in LEVELS ? raw : 'error';
+}
+
 // Binary field names that commonly contain large base64 data
 const BINARY_FIELDS = ['b64_json', 'base64', 'bytesBase64Encoded', 'inlineData', 'data', 'buffer', 'blob'];
 const BINARY_PLACEHOLDER = '[BINARY_DATA]';
@@ -62,6 +71,9 @@ class Logger {
         this.sessionId = this._generateSessionId();
         this.logRetentionDays = this._resolveLogRetentionDays();
 
+        // Minimum level for a message to be written. Runtime-settable via setLevel().
+        this.minLevel = resolveInitialLevel();
+
         // Main log state
         this._mainLogBuffer = [];
         this._mainLogCurrentSize = 0;
@@ -76,6 +88,29 @@ class Logger {
         }
     }
     
+    /**
+     * Set the minimum log level at runtime ('debug'|'info'|'warn'|'error').
+     * Returns the level actually set (throws on an unknown level).
+     */
+    setLevel(level) {
+        const normalized = String(level || '').toLowerCase();
+        if (!(normalized in LEVELS)) {
+            throw new Error(`Unknown log level: "${level}". Must be one of: ${Object.keys(LEVELS).join(', ')}`);
+        }
+        const previous = this.minLevel;
+        this.minLevel = normalized;
+        this._writeToFile(`[${new Date().toISOString()}] [INFO] [System] Log level changed: ${previous} -> ${normalized}`);
+        return normalized;
+    }
+
+    getLevel() {
+        return this.minLevel;
+    }
+
+    _shouldWrite(level) {
+        return LEVELS[level] >= LEVELS[this.minLevel];
+    }
+
     _generateSessionId() {
         return `${this.sessionPrefix}-${Date.now().toString(36).slice(-6)}`;
     }
@@ -507,6 +542,7 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     info(message, meta = {}, type = 'System', options = {}) {
+        if (!this._shouldWrite('info')) return;
         const safeMeta = this._sanitizeMeta(meta);
         const formatted = this._formatMessage('INFO', type, message, safeMeta);
         this._writeToFile(formatted);
@@ -525,6 +561,7 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     warn(message, meta = {}, type = 'System', options = {}) {
+        if (!this._shouldWrite('warn')) return;
         const safeMeta = this._sanitizeMeta(meta);
         const formatted = this._formatMessage('WARN', type, message, safeMeta);
         this._writeToFile(formatted);
@@ -544,6 +581,7 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     error(message, error = null, meta = null, type = 'System', options = {}) {
+        if (!this._shouldWrite('error')) return;
         const errorMeta = error ? {
             error: error.message,
             stack: error.stack ? this._sanitizeMessage(error.stack) : undefined,
@@ -567,16 +605,15 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     debug(message, meta = {}, type = 'System', options = {}) {
-        if (process.env.DEBUG || process.env.NODE_ENV === 'development') {
-            const safeMeta = this._sanitizeMeta(meta);
-            const formatted = this._formatMessage('DEBUG', type, message, safeMeta);
-            this._writeToFile(formatted);
-            if (this.enableMainLog) {
-                this._writeToMainLog('DEBUG', type, message, safeMeta);
-            }
-            if (options.console) {
-                console.log(formatted);
-            }
+        if (!this._shouldWrite('debug')) return;
+        const safeMeta = this._sanitizeMeta(meta);
+        const formatted = this._formatMessage('DEBUG', type, message, safeMeta);
+        this._writeToFile(formatted);
+        if (this.enableMainLog) {
+            this._writeToMainLog('DEBUG', type, message, safeMeta);
+        }
+        if (options.console) {
+            console.log(formatted);
         }
     }
     
