@@ -30,6 +30,11 @@ const BINARY_PLACEHOLDER = '[BINARY_DATA]';
 const LONG_STRING_THRESHOLD = 500;
 const TRUNCATE_TO_LENGTH = 200;
 
+// Log levels — higher number = more verbose. Controls what gets written to files.
+// LOG_LEVEL env: error | warn (default) | info | debug
+const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
+const DEFAULT_LOG_LEVEL = 'warn';
+
 /**
  * Logger class - handles file-based logging with structured formatting
  */
@@ -55,6 +60,11 @@ class Logger {
         this.maxFileSizeBytes = options.maxFileSizeBytes || DEFAULT_MAX_FILE_SIZE_BYTES;
         this.maxMainLogFiles = options.maxMainLogFiles || DEFAULT_MAX_MAIN_LOG_FILES;
         this.flushIntervalMs = options.flushIntervalMs || DEFAULT_FLUSH_INTERVAL_MS;
+
+        // Log level gate: only levels <= this value are written to files.
+        // Default "warn" = only warn + error. Set LOG_LEVEL=debug for everything.
+        const envLevel = (process.env.LOG_LEVEL || '').toLowerCase();
+        this._levelValue = LOG_LEVELS[envLevel] ?? LOG_LEVELS[DEFAULT_LOG_LEVEL];
 
         this.logFile = null;
         this.logStream = null;
@@ -135,6 +145,10 @@ class Logger {
             .replace(/\t/g, '    ')
             .replace(/\s+/g, ' ')
             .trim();
+    }
+
+    _shouldLog(level) {
+        return (LOG_LEVELS[level] ?? 99) <= this._levelValue;
     }
 
     _initializeLogFile() {
@@ -487,6 +501,7 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     info(message, meta = {}, type = 'System', options = {}) {
+        if (!this._shouldLog('info')) return;
         const safeMeta = this._sanitizeMeta(meta);
         const formatted = this._formatMessage('INFO', type, message, safeMeta);
         this._writeToFile(formatted);
@@ -505,6 +520,7 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     warn(message, meta = {}, type = 'System', options = {}) {
+        if (!this._shouldLog('warn')) return;
         const safeMeta = this._sanitizeMeta(meta);
         const formatted = this._formatMessage('WARN', type, message, safeMeta);
         this._writeToFile(formatted);
@@ -524,6 +540,7 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     error(message, error = null, meta = null, type = 'System', options = {}) {
+        // Errors always log — they bypass the level gate.
         const errorMeta = error ? {
             error: error.message,
             stack: error.stack ? this._sanitizeMessage(error.stack) : undefined,
@@ -547,16 +564,15 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     debug(message, meta = {}, type = 'System', options = {}) {
-        if (process.env.DEBUG || process.env.NODE_ENV === 'development') {
-            const safeMeta = this._sanitizeMeta(meta);
-            const formatted = this._formatMessage('DEBUG', type, message, safeMeta);
-            this._writeToFile(formatted);
-            if (this.enableMainLog) {
-                this._writeToMainLog('DEBUG', type, message, safeMeta);
-            }
-            if (options.console) {
-                console.log(formatted);
-            }
+        if (!this._shouldLog('debug')) return;
+        const safeMeta = this._sanitizeMeta(meta);
+        const formatted = this._formatMessage('DEBUG', type, message, safeMeta);
+        this._writeToFile(formatted);
+        if (this.enableMainLog) {
+            this._writeToMainLog('DEBUG', type, message, safeMeta);
+        }
+        if (options.console) {
+            console.log(formatted);
         }
     }
     
