@@ -24,16 +24,20 @@ const DEFAULT_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
 const DEFAULT_MAX_MAIN_LOG_FILES = 10;
 const DEFAULT_FLUSH_INTERVAL_MS = 1000;
 
+// Log levels. The gateway runs quiet by default (errors only) and is switched
+// to verbose when actively working on it. minLevel is runtime-settable.
+const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+
+function resolveInitialLevel() {
+    const raw = (process.env.LOG_LEVEL || '').toLowerCase();
+    return raw in LEVELS ? raw : 'error';
+}
+
 // Binary field names that commonly contain large base64 data
 const BINARY_FIELDS = ['b64_json', 'base64', 'bytesBase64Encoded', 'inlineData', 'data', 'buffer', 'blob'];
 const BINARY_PLACEHOLDER = '[BINARY_DATA]';
 const LONG_STRING_THRESHOLD = 500;
 const TRUNCATE_TO_LENGTH = 200;
-
-// Log levels — higher number = more verbose. Controls what gets written to files.
-// LOG_LEVEL env: error | warn (default) | info | debug
-const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
-const DEFAULT_LOG_LEVEL = 'warn';
 
 /**
  * Logger class - handles file-based logging with structured formatting
@@ -61,16 +65,14 @@ class Logger {
         this.maxMainLogFiles = options.maxMainLogFiles || DEFAULT_MAX_MAIN_LOG_FILES;
         this.flushIntervalMs = options.flushIntervalMs || DEFAULT_FLUSH_INTERVAL_MS;
 
-        // Log level gate: only levels <= this value are written to files.
-        // Default "warn" = only warn + error. Set LOG_LEVEL=debug for everything.
-        const envLevel = (process.env.LOG_LEVEL || '').toLowerCase();
-        this._levelValue = LOG_LEVELS[envLevel] ?? LOG_LEVELS[DEFAULT_LOG_LEVEL];
-
         this.logFile = null;
         this.logStream = null;
         this.startTime = new Date();
         this.sessionId = this._generateSessionId();
         this.logRetentionDays = this._resolveLogRetentionDays();
+
+        // Minimum level for a message to be written. Runtime-settable via setLevel().
+        this.minLevel = resolveInitialLevel();
 
         // Main log state
         this._mainLogBuffer = [];
@@ -86,15 +88,41 @@ class Logger {
         }
     }
     
+    /**
+     * Set the minimum log level at runtime ('debug'|'info'|'warn'|'error').
+     * Returns the level actually set (throws on an unknown level).
+     */
+    setLevel(level) {
+        const normalized = String(level || '').toLowerCase();
+        if (!(normalized in LEVELS)) {
+            throw new Error(`Unknown log level: "${level}". Must be one of: ${Object.keys(LEVELS).join(', ')}`);
+        }
+        const previous = this.minLevel;
+        this.minLevel = normalized;
+        this._writeToFile(`[${new Date().toISOString()}] [INFO] [System] Log level changed: ${previous} -> ${normalized}`);
+        return normalized;
+    }
+
+    getLevel() {
+        return this.minLevel;
+    }
+
+    _shouldWrite(level) {
+        return LEVELS[level] >= LEVELS[this.minLevel];
+    }
+
     _generateSessionId() {
         return `${this.sessionPrefix}-${Date.now().toString(36).slice(-6)}`;
     }
 
     _isLongBase64(value) {
-        if (typeof value !== 'string' || value.length < 100) return false;
+        // Cheap length gate first: a string must exceed the threshold before it
+        // can be 'long base64'. Short-circuiting here avoids running the full
+        // regex scan on every string ≥100 chars (the common hot-path case).
+        if (typeof value !== 'string' || value.length <= LONG_STRING_THRESHOLD) return false;
         // Base64 pattern: alphanumeric with +/= at end
         const base64Pattern = /^[A-Za-z0-9+/=]+$/;
-        return base64Pattern.test(value) && value.length > LONG_STRING_THRESHOLD;
+        return base64Pattern.test(value);
     }
 
     _sanitizeValue(value) {
@@ -133,22 +161,26 @@ class Logger {
 
     _sanitizeMeta(meta) {
         if (!meta || typeof meta !== 'object') return {};
+        // Fast path: if no value could possibly need sanitizing (no long strings,
+        // no binary fields, no nested objects/arrays), return meta as-is and skip
+        // the deep-copy entirely. This is the common hot-path case.
+        let needsSanitize = false;
+        for (const val of Object.values(meta)) {
+            if (typeof val === 'string' && val.length > 100) { needsSanitize = true; break; }
+            if (val !== null && typeof val === 'object') { needsSanitize = true; break; }
+        }
+        if (!needsSanitize) return meta;
         return this._sanitizeValue(meta);
     }
 
     _sanitizeMessage(message) {
         if (typeof message !== 'string') return message;
+        // Single pass: replace CR/LF/TAB runs with the desired output directly,
+        // then collapse remaining whitespace. Replaces 5 sequential regex scans.
         return message
-            .replace(/\r\n/g, '\\n')
-            .replace(/\n/g, '\\n')
-            .replace(/\r/g, '\\n')
-            .replace(/\t/g, '    ')
-            .replace(/\s+/g, ' ')
+            .replace(/\r\n|[\n\r]|\t/g, (m) => (m === '\t' ? '    ' : '\\n'))
+            .replace(/ {2,}/g, ' ')
             .trim();
-    }
-
-    _shouldLog(level) {
-        return (LOG_LEVELS[level] ?? 99) <= this._levelValue;
     }
 
     _initializeLogFile() {
@@ -238,6 +270,8 @@ class Logger {
         this._openMainLogStream();
         this._pruneMainLogs();
         this._flushTimer = setInterval(() => this._flushBuffer(), this.flushIntervalMs);
+        // Don't let the flush timer keep the process alive on its own.
+        this._flushTimer.unref();
     }
 
     // Migrate old monotonically-incrementing main-N.log files into the ring buffer.
@@ -325,7 +359,8 @@ class Logger {
             ts: new Date().toISOString(),
             level,
             type,
-            msg: message,
+            // Sanitize for JSONL: raw newlines would break one-line-per-entry.
+            msg: this._sanitizeMessage(message),
             meta: Object.keys(meta).length > 0 ? meta : undefined,
             session: this.sessionId
         };
@@ -419,8 +454,12 @@ class Logger {
                 const rotatedPath = path.join(this.logsDir, `${this.mainLogPrefix}-1.log`);
                 fs.renameSync(currentPath, rotatedPath);
             }
-        } catch {
-            // Best-effort rotation — next write will create a fresh main-0.log
+        } catch (err) {
+            // Rotation failure is serious — a main log that never rotates grows
+            // unbounded. Surface it loudly to the session log and stderr, never swallow.
+            const msg = `[${new Date().toISOString()}] [ERROR] [System] Main log rotation FAILED: ${err.message}`;
+            try { this._writeToFile(msg); } catch {}
+            try { process.stderr.write(msg + '\n'); } catch {}
         }
     }
 
@@ -451,8 +490,10 @@ class Logger {
             for (let i = keepMax; i < mainLogs.length; i++) {
                 fs.unlinkSync(mainLogs[i].path);
             }
-        } catch {
-            // Log retention failures should not stop the app
+        } catch (err) {
+            // Prune failure means old logs accumulate forever — surface, don't swallow.
+            const msg = `[${new Date().toISOString()}] [WARN] [System] Main log prune FAILED: ${err.message}`;
+            try { this._writeToFile(msg); } catch {}
         }
     }
 
@@ -501,7 +542,7 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     info(message, meta = {}, type = 'System', options = {}) {
-        if (!this._shouldLog('info')) return;
+        if (!this._shouldWrite('info')) return;
         const safeMeta = this._sanitizeMeta(meta);
         const formatted = this._formatMessage('INFO', type, message, safeMeta);
         this._writeToFile(formatted);
@@ -520,7 +561,7 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     warn(message, meta = {}, type = 'System', options = {}) {
-        if (!this._shouldLog('warn')) return;
+        if (!this._shouldWrite('warn')) return;
         const safeMeta = this._sanitizeMeta(meta);
         const formatted = this._formatMessage('WARN', type, message, safeMeta);
         this._writeToFile(formatted);
@@ -564,7 +605,7 @@ class Logger {
      * @param {string} type - Event type/category (default: 'System')
      */
     debug(message, meta = {}, type = 'System', options = {}) {
-        if (!this._shouldLog('debug')) return;
+        if (!this._shouldWrite('debug')) return;
         const safeMeta = this._sanitizeMeta(meta);
         const formatted = this._formatMessage('DEBUG', type, message, safeMeta);
         this._writeToFile(formatted);
