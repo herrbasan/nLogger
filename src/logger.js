@@ -24,13 +24,14 @@ const DEFAULT_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
 const DEFAULT_MAX_MAIN_LOG_FILES = 10;
 const DEFAULT_FLUSH_INTERVAL_MS = 1000;
 
-// Log levels. The gateway runs quiet by default (errors only) and is switched
-// to verbose when actively working on it. minLevel is runtime-settable.
+// Log levels. The gateway logs at info by default (startup, lifecycle,
+// stream start/end telemetry). Set LOG_LEVEL=error for errors-only, or
+// =debug when actively working on it. minLevel is runtime-settable.
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 
 function resolveInitialLevel() {
     const raw = (process.env.LOG_LEVEL || '').toLowerCase();
-    return raw in LEVELS ? raw : 'error';
+    return raw in LEVELS ? raw : 'info';
 }
 
 // Binary field names that commonly contain large base64 data
